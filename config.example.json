@@ -1,0 +1,19 @@
+{
+  "esslUrl": "http://192.168.1.140/iclock/WebAPIService.asmx",
+  "esslUser": "CHANGE_ME",
+  "esslPassword": "CHANGE_ME",
+  "serialNumber": "BRM9202760325",
+  "timezoneOffset": "+05:30",
+  "syncFrom": "2026-09-24 00:00",
+  "ingestUrl": "https://YOUR_API_HOST/api/hrms/ingest/SOURCE_ID",
+  "ingestSecret": "CHANGE_ME",
+  "method": "GetTransactionsLog",
+  "soapFields": ["FromDate", "ToDate", "SerialNumber", "UserName", "UserPassword", "strDataList"],
+  "columns": {
+    "recordSeparator": "\n",
+    "fieldSeparator": "\t",
+    "employeeCode": 0,
+    "timestamp": 1,
+    "direction": -1
+  }
+}

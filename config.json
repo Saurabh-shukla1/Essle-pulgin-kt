@@ -1,0 +1,19 @@
+{
+  "esslUrl": "http://192.168.1.220/iclock/WebAPIService.asmx",
+  "esslUser": "essl",
+  "esslPassword": "essl",
+  "serialNumber": "BJ2C183961076",
+  "timezoneOffset": "+05:30",
+  "syncFrom": "2026/09/24 00:00",
+  "ingestUrl": "https://dashboard-api-dev.omnipresence.in/api/hrms/ingest/0bb9a7b6-7a9d-4ec9-98f3-c33a19563cf4",
+  "ingestSecret": "d3325793909d2d1fc8d44edd76e3bb6095d4b8f35568249e53320b1a59737466",
+  "method": "GetTransactionsLog",
+  "soapFields": ["FromDate", "ToDate", "SerialNumber", "UserName", "UserPassword", "strDataList"],
+  "columns": {
+    "recordSeparator": "\n",
+    "fieldSeparator": "\t",
+    "employeeCode": 0,
+    "timestamp": 1,
+    "direction": -1
+  }
+}
