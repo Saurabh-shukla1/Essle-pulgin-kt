@@ -15,7 +15,7 @@ const config = {
   serialNumber: "BRM9202760325",
   timezoneOffset: "+05:30",
   method: "GetTransactionsLog",
-  soapFields: ["FromDate", "ToDate", "SerialNumber", "UserName", "UserPassword", "strDataList"],
+  soapFields: ["FromDateTime", "ToDateTime", "SerialNumber", "UserName", "UserPassword", "strDataList"],
   columns: {
     recordSeparator: "\n",
     fieldSeparator: "\t",
@@ -27,8 +27,8 @@ const config = {
 
 test("soap envelope matches the GetTransactionsLog sample", () => {
   const xml = buildSoapEnvelope(config, { from: "2021-05-22 09:05", to: "2021-05-23 16:30" });
-  assert.match(xml, /<FromDate>2021-05-22 09:05<\/FromDate>/);
-  assert.match(xml, /<ToDate>2021-05-23 16:30<\/ToDate>/);
+  assert.match(xml, /<FromDateTime>2021-05-22 09:05<\/FromDateTime>/);
+  assert.match(xml, /<ToDateTime>2021-05-23 16:30<\/ToDateTime>/);
   assert.match(xml, /<SerialNumber>BRM9202760325<\/SerialNumber>/);
   assert.match(xml, /<UserPassword>p&amp;ss<\/UserPassword>/);
   assert.match(xml, /<strDataList><\/strDataList>/);

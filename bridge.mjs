@@ -115,6 +115,7 @@ export function buildSoapEnvelope(config, range) {
     Password: config.esslPassword,
     UserPassword: config.esslPassword,
     SerialNumber: config.serialNumber ?? "",
+    SerialNo: config.serialNumber ?? "",
     FromDate: range.from,
     ToDate: range.to,
     FromDateTime: range.from,
@@ -275,10 +276,13 @@ async function discover(config) {
   console.log(sample ? decodeXml(sample[1].replaceAll("<br>", "\n")) : "No sample found. Open that ?op= URL in a browser.");
 }
 
-async function fetchLogs(config, lastTimestamp) {
+async function fetchLogs(config, lastTimestamp, options = {}) {
   const from = formatEsslDate(lastTimestamp, config.timezoneOffset);
   const to = nowEsslDate(config.timezoneOffset);
   const soap = buildSoapEnvelope(config, { from, to });
+  if (options.printSoap) {
+    console.log("SOAP request body:\n", soap);
+  }
   const xml = await esslFetch(config.esslUrl, {
     method: "POST",
     headers: {
@@ -319,9 +323,24 @@ async function main() {
   }
 
   const lastTimestamp = await readCursor(config);
-  const { rows, skipped, note, from, to } = await fetchLogs(config, lastTimestamp);
+  const printSoap = args.has("--print-soap");
+  const { rows, skipped, note, from, to } = await fetchLogs(config, lastTimestamp, { printSoap });
   if (note && rows.length === 0) {
     console.log(`eSSL ${from} → ${to} returned no punch rows: ${note.slice(0, 500)}`);
+    if (/unauth/i.test(note)) {
+      console.log(
+        [
+          "",
+          "Web API auth failed (not the same as desktop eTimeTrackLite login unless both use the same DB).",
+          `  esslUser sent: ${config.esslUser}`,
+          `  serialNumber sent: ${config.serialNumber}`,
+          "  1) Log in at http://<host>:85/iclock/ with the same username/password.",
+          "  2) In the WEB app: Admin → Users → edit user → Is Admin (or full permissions).",
+          "  3) Or create a new web user there and put that login in config.json.",
+          "  4) If web login fails, run eTimeTrackDatabaseSettings on the server so Web uses the same DB as desktop.",
+        ].join("\n"),
+      );
+    }
     return;
   }
   if (rows.length === 0) {
