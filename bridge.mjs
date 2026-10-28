@@ -1,17 +1,29 @@
 #!/usr/bin/env node
 /**
- * Office-PC bridge: pull new eSSL punches and POST them to the HRMS webhook.
+ * Office-PC bridge between eSSL eTimeTrackLite Web (SOAP) and Omni HRMS.
  *
  *   cp config.example.json config.json   # then fill in the values
  *   node bridge.mjs --discover           # list SOAP methods and the live sample
- *   node bridge.mjs --dry-run            # fetch and print, do not push or move the cursor
- *   node bridge.mjs                      # push new punches and save the cursor
+ *   node bridge.mjs --dry-run            # fetch and print punches, push nothing, move no cursor
+ *   node bridge.mjs                      # one pass: push new punches, run queued device commands
+ *   node bridge.mjs --watch              # keep running: commands every ~15 s, punches every 5 min
  *
- * Calls eTimeTrackLite GetTransactionsLog (FromDate/ToDate). cursor.json stores
- * the latest punch time successfully pushed. The same minute is asked again
- * next run; externalEventId is serial|employee|time, so the webhook stores it
- * once. The sample request uses FromDate/ToDate. If the server rejects those
- * names, set soapFields to FromDateTime and ToDateTime.
+ * install-task.ps1 runs `--watch` as a Windows scheduled task (SYSTEM, starts
+ * at boot, restarted if it stops).
+ *
+ * Punches: GetTransactionsLog per device serial number. cursor.json (one
+ * device) or cursor-<serial>.json (devices list) stores the latest punch time
+ * pushed. Each pass asks again from lookbackMinutes (default 120) before the
+ * cursor so late-arriving punches are not missed; externalEventId is
+ * serial|employee|time, so Omni stores each punch once. The sample request
+ * uses FromDate/ToDate; if the server rejects those names, set soapFields to
+ * FromDateTime and ToDateTime.
+ *
+ * Device commands: HR queues add / block / unblock / delete in Omni. The
+ * bridge claims them over the same signed channel as punches, calls
+ * AddEmployee / BlockUnblockUser / DeleteUser, reports the outcome, and polls
+ * GetCommandStatus until the device confirms. Only types listed in
+ * allowCommands are carried out; the rest are reported back as refused.
  */
 import { createHmac } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
@@ -23,6 +35,7 @@ const configPath = join(root, "config.json");
 const cursorPath = join(root, "cursor.json");
 const BATCH_SIZE = 500;
 const FETCH_TIMEOUT_MS = 30_000;
+const DEFAULT_LOOKBACK_MINUTES = 120;
 
 export function decodeXml(value) {
   return value
@@ -87,13 +100,35 @@ export function formatEsslDate(iso, offset) {
   return formatEsslDate(parsed, offset);
 }
 
-export function nowEsslDate(offset) {
+/** Epoch ms → ISO-8601 wall clock in the configured offset, e.g. 2026-10-28T09:05:00+05:30. */
+export function isoInOffset(ms, offset) {
   const match = offset.match(/^([+-])(\d{2}):(\d{2})$/);
   const sign = match[1] === "-" ? -1 : 1;
   const shiftMs = sign * (Number(match[2]) * 60 + Number(match[3])) * 60_000;
-  const shifted = new Date(Date.now() + shiftMs);
+  const shifted = new Date(ms + shiftMs);
   const pad = (n) => String(n).padStart(2, "0");
-  return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+  return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}T${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())}${offset}`;
+}
+
+export function nowEsslDate(offset) {
+  return formatEsslDate(isoInOffset(Date.now(), offset), offset);
+}
+
+/**
+ * Where a run starts asking eSSL: lookbackMinutes before the cursor, never
+ * before syncFrom. Punches that reach the eSSL server late (device offline,
+ * out-of-order upload) still get sent; the webhook drops the repeats.
+ */
+export function lookbackStart(cursor, config) {
+  const minutes = Number(config.lookbackMinutes ?? DEFAULT_LOOKBACK_MINUTES);
+  if (!(minutes > 0)) return cursor;
+  const floor = toIsoTimestamp(config.syncFrom, config.timezoneOffset);
+  const start = Math.max(Date.parse(cursor) - minutes * 60_000, floor ? Date.parse(floor) : -Infinity);
+  return start < Date.parse(cursor) ? isoInOffset(start, config.timezoneOffset) : cursor;
+}
+
+export function laterTimestamp(a, b) {
+  return Date.parse(b) > Date.parse(a) ? b : a;
 }
 
 export function punchDirection(value) {
@@ -125,12 +160,15 @@ export function buildSoapEnvelope(config, range) {
     Location: config.location ?? "",
     LocationCode: config.location ?? "",
   };
-  const inner = fields
-    .map((name) => {
-      const value = Object.prototype.hasOwnProperty.call(values, name) ? values[name] : "";
-      return `<${name}>${escapeXml(value)}</${name}>`;
-    })
-    .join("");
+  return soapEnvelope(
+    method,
+    fields.map((name) => [name, Object.prototype.hasOwnProperty.call(values, name) ? values[name] : ""]),
+  );
+}
+
+/** One SOAP 1.1 request body; `fields` are [name, value] pairs in the service's order. */
+export function soapEnvelope(method, fields) {
+  const inner = fields.map(([name, value]) => `<${name}>${escapeXml(value ?? "")}</${name}>`).join("");
   return `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
@@ -204,10 +242,118 @@ export function signIngestBody(body, secret) {
   return createHmac("sha256", secret).update(body).digest("hex");
 }
 
+export const DEVICE_COMMAND_TYPES = ["ADD_EMPLOYEE", "BLOCK", "UNBLOCK", "DELETE"];
+
+/**
+ * The devices this bridge serves. `devices` in config.json lists several (one
+ * Omni source each); without it the top-level serialNumber / ingestUrl /
+ * ingestSecret describe the only device and keep cursor.json.
+ */
+export function deviceList(config) {
+  if (Array.isArray(config.devices) && config.devices.length > 0) {
+    return config.devices.map((device) => ({
+      label: device.name || device.serialNumber,
+      serialNumber: device.serialNumber,
+      ingestUrl: device.ingestUrl,
+      ingestSecret: device.ingestSecret,
+      syncFrom: device.syncFrom ?? config.syncFrom,
+      cursorPath: join(root, `cursor-${String(device.serialNumber).replace(/[^A-Za-z0-9_-]/g, "_")}.json`),
+    }));
+  }
+  return [
+    {
+      label: config.serialNumber,
+      serialNumber: config.serialNumber,
+      ingestUrl: config.ingestUrl,
+      ingestSecret: config.ingestSecret,
+      syncFrom: config.syncFrom,
+      cursorPath,
+    },
+  ];
+}
+
+/** SOAP method and fields for one queued command (eTimeTrackLite Web API 1.3). */
+export function deviceCommandRequest(command, config, device) {
+  const apiKey = ["APIKey", config.apiKey ?? ""];
+  const code = ["EmployeeCode", command.employeeCode];
+  const name = ["EmployeeName", (command.employeeName ?? "").trim()];
+  const serial = ["SerialNumber", device.serialNumber];
+  const auth = [
+    ["UserName", config.esslUser],
+    ["UserPassword", config.esslPassword],
+  ];
+  switch (command.type) {
+    case "ADD_EMPLOYEE":
+      // AddEmployee's CommandId is an int: send 0, a blank fails deserialization.
+      return {
+        method: "AddEmployee",
+        fields: [apiKey, code, name, ["CardNumber", ""], serial, ...auth, ["CommandId", 0]],
+      };
+    case "BLOCK":
+    case "UNBLOCK":
+      return {
+        method: "BlockUnblockUser",
+        fields: [apiKey, code, name, serial, ["IsBlock", command.type === "BLOCK" ? "true" : "false"], ...auth, ["CommandId", ""]],
+      };
+    case "DELETE":
+      return { method: "DeleteUser", fields: [apiKey, code, serial, ...auth, ["CommandId", ""]] };
+    default:
+      throw new Error(`Unknown device command type ${command.type}`);
+  }
+}
+
+function soapTag(xml, name) {
+  const match = xml.match(
+    new RegExp(`<(?:[\\w]+:)?${name}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/(?:[\\w]+:)?${name}>`, "i"),
+  );
+  return match ? decodeXml(match[1]).trim() : "";
+}
+
+/** `<Method>Result` and `<CommandId>` of a reply. Throws on a SOAP fault. */
+export function parseSoapReply(xml, method) {
+  const fault = soapTag(xml, "faultstring");
+  if (fault) throw new Error(fault.replace(/\s+/g, " "));
+  return { result: soapTag(xml, `${method}Result`), commandId: soapTag(xml, "CommandId") };
+}
+
+const FAILURE_RE = /unsucc|fail|error|invalid|unauth|unathor|denied|reject|not\s*found|not\s*exist|already|timeout|timed\s*out/i;
+const SUCCESS_RE = /succe/i;
+
+/**
+ * What to report for a command reply. The manual only says "success or
+ * failure", so anything that does not read as success is reported as failed
+ * with eSSL's own text, and HR can retry it.
+ */
+export function commandOutcome(reply) {
+  const result = reply.result;
+  if (FAILURE_RE.test(result) || !SUCCESS_RE.test(result)) {
+    return { outcome: "failed", message: result ? `eSSL: ${result}` : "eSSL returned an empty result" };
+  }
+  const vendorCommandId = reply.commandId && !/^(0|blank)$/i.test(reply.commandId) ? reply.commandId : null;
+  // With a command id the device's confirmation is polled; without one there is nothing to wait for.
+  return vendorCommandId
+    ? { outcome: "sent", vendorCommandId, message: result }
+    : { outcome: "applied", message: result };
+}
+
+/** GetCommandStatus text → final outcome, or null while the device has not answered yet. */
+export function statusOutcome(text) {
+  if (FAILURE_RE.test(text)) return "failed";
+  if (SUCCESS_RE.test(text)) return "applied";
+  return null;
+}
+
 function requireConfig(config) {
-  const missing = ["esslUrl", "esslUser", "esslPassword", "serialNumber", "method", "timezoneOffset", "syncFrom"].filter(
+  const missing = ["esslUrl", "esslUser", "esslPassword", "method", "timezoneOffset", "syncFrom"].filter(
     (key) => !config[key],
   );
+  const hasDevices = Array.isArray(config.devices) && config.devices.length > 0;
+  if (!hasDevices && !config.serialNumber) missing.push("serialNumber (or a devices list)");
+  if (hasDevices) {
+    config.devices.forEach((device, index) => {
+      if (!device?.serialNumber) missing.push(`devices[${index}].serialNumber`);
+    });
+  }
   if (!Array.isArray(config.soapFields) || config.soapFields.length === 0) missing.push("soapFields");
   if (!config.columns) missing.push("columns");
   if (missing.length > 0) {
@@ -215,6 +361,13 @@ function requireConfig(config) {
   }
   if (!/^[+-]\d{2}:\d{2}$/.test(config.timezoneOffset)) {
     throw new Error('timezoneOffset must look like "+05:30"');
+  }
+  if (config.lookbackMinutes !== undefined && !(Number(config.lookbackMinutes) >= 0)) {
+    throw new Error("lookbackMinutes must be 0 or a positive number");
+  }
+  const unknown = (config.allowCommands ?? []).filter((type) => !DEVICE_COMMAND_TYPES.includes(type));
+  if (unknown.length > 0) {
+    throw new Error(`allowCommands has unknown types: ${unknown.join(", ")} (use ${DEVICE_COMMAND_TYPES.join(", ")})`);
   }
 }
 
@@ -230,26 +383,29 @@ async function loadConfig() {
   return config;
 }
 
-async function readCursor(config) {
+async function readCursor(device, config) {
   try {
-    const saved = JSON.parse(await readFile(cursorPath, "utf8"));
+    const saved = JSON.parse(await readFile(device.cursorPath, "utf8"));
     if (saved.lastTimestamp) return String(saved.lastTimestamp);
   } catch {
     // first run uses syncFrom
   }
-  const start = toIsoTimestamp(config.syncFrom, config.timezoneOffset);
-  if (!start) throw new Error(`syncFrom "${config.syncFrom}" is not a recognizable date`);
+  const start = toIsoTimestamp(device.syncFrom, config.timezoneOffset);
+  if (!start) throw new Error(`syncFrom "${device.syncFrom}" is not a recognizable date`);
   return start;
 }
 
-async function writeCursor(lastTimestamp) {
-  await writeFile(cursorPath, `${JSON.stringify({ lastTimestamp }, null, 2)}\n`);
+async function writeCursor(device, lastTimestamp) {
+  await writeFile(device.cursorPath, `${JSON.stringify({ lastTimestamp }, null, 2)}\n`);
 }
 
 async function esslFetch(url, options = {}) {
   const response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), ...options });
   const text = await response.text();
   if (!response.ok) {
+    // A SOAP fault arrives as HTTP 500 with the reason inside; surface that.
+    const fault = text.match(/<(?:[\w]+:)?faultstring[^>]*>([\s\S]*?)<\/(?:[\w]+:)?faultstring>/i);
+    if (fault) throw new Error(`eSSL: ${decodeXml(fault[1]).replace(/\s+/g, " ").trim()}`);
     let hint = "";
     if (text.includes("500.24")) {
       hint =
@@ -260,6 +416,17 @@ async function esslFetch(url, options = {}) {
     throw new Error(`eSSL HTTP ${response.status}: ${text.slice(0, 300)}${hint}`);
   }
   return text;
+}
+
+function soapCall(config, method, fields) {
+  return esslFetch(config.esslUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "text/xml; charset=utf-8",
+      SOAPAction: `"http://tempuri.org/${method}"`,
+    },
+    body: soapEnvelope(method, fields),
+  });
 }
 
 async function discover(config) {
@@ -295,22 +462,199 @@ async function fetchLogs(config, lastTimestamp, options = {}) {
   return { ...parsePunchRows(result, config, lastTimestamp), from, to };
 }
 
-async function pushBatch(config, events) {
-  const body = JSON.stringify({ events });
-  const response = await fetch(config.ingestUrl, {
+function requireIngest(device) {
+  if (!device.ingestUrl || !device.ingestSecret || device.ingestSecret === "CHANGE_ME") {
+    throw new Error(`Set ingestUrl and ingestSecret for ${device.label} in config.json.`);
+  }
+}
+
+async function postSigned(url, secret, payload) {
+  const body = JSON.stringify(payload);
+  const response = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-hrms-signature": signIngestBody(body, config.ingestSecret),
+      "x-hrms-signature": signIngestBody(body, secret),
     },
     body,
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
-  const payload = await response.json().catch(() => ({}));
+  const reply = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(`ingest HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    throw new Error(`Omni HTTP ${response.status}: ${JSON.stringify(reply)}`);
   }
-  return payload;
+  return reply;
+}
+
+async function syncPunches(config, device, options = {}) {
+  // Punch helpers read the serial number from the config they are given.
+  const deviceConfig = { ...config, serialNumber: device.serialNumber, syncFrom: device.syncFrom };
+  const tag = `[${device.label}]`;
+  const lastTimestamp = await readCursor(device, config);
+  const since = lookbackStart(lastTimestamp, deviceConfig);
+  const { rows, skipped, note, from, to } = await fetchLogs(deviceConfig, since, options);
+  if (note && rows.length === 0) {
+    console.log(`${tag} eSSL ${from} → ${to} returned no punch rows: ${note.slice(0, 500)}`);
+    // eSSL replies "Unathorised User" (sic), so match both spellings.
+    if (/una(u)?th/i.test(note)) {
+      console.log(
+        [
+          "",
+          "Web API auth failed (not the same as desktop eTimeTrackLite login unless both use the same DB).",
+          `  esslUser sent: ${config.esslUser}`,
+          `  serialNumber sent: ${device.serialNumber}`,
+          "  1) Log in at http://<host>:85/iclock/ with the same username/password.",
+          "  2) In the WEB app: Admin → Users → edit user → Is Admin (or full permissions).",
+          "  3) Or create a new web user there and put that login in config.json.",
+          "  4) If web login fails, run eTimeTrackDatabaseSettings on the server so Web uses the same DB as desktop.",
+        ].join("\n"),
+      );
+    }
+    return;
+  }
+  if (rows.length === 0) {
+    if (!options.quiet) console.log(`${tag} No new punches from ${from} to ${to}.`);
+    return;
+  }
+
+  const sendable = rows.filter((row) => row.event).length;
+  console.log(`${tag} Fetched ${rows.length} log(s) from ${from} to ${to} (${sendable} pushable, ${skipped} skipped).`);
+  console.log(`${tag} First row: ${rows[0].raw}`);
+
+  if (options.dryRun) {
+    for (const row of rows.slice(0, 5)) {
+      console.log(row.event ?? `(skipped) ${row.raw}`);
+    }
+    console.log(`${tag} Dry run: nothing posted, cursor unchanged.`);
+    return;
+  }
+
+  requireIngest(device);
+  let cursor = lastTimestamp;
+  for (let index = 0; index < rows.length; index += BATCH_SIZE) {
+    const batch = rows.slice(index, index + BATCH_SIZE);
+    const events = batch.flatMap((row) => (row.event ? [row.event] : []));
+    const result =
+      events.length > 0
+        ? await postSigned(device.ingestUrl, device.ingestSecret, { events })
+        : { accepted: 0, duplicates: 0, unmatched: 0 };
+    // Look-back rows can all predate the saved cursor; never move it backwards.
+    cursor = laterTimestamp(cursor, batch[batch.length - 1].timestamp);
+    await writeCursor(device, cursor);
+    console.log(tag, { from: batch[0].timestamp, to: cursor, ...result });
+  }
+}
+
+/** Results Omni has not acknowledged yet (network blip); resent on the next pass. */
+const unsentResults = new Map();
+
+async function processCommands(config, device) {
+  requireIngest(device);
+  const tag = `[${device.label}]`;
+  const allowed = new Set(config.allowCommands ?? []);
+  const claim = await postSigned(`${device.ingestUrl}/commands/claim`, device.ingestSecret, {
+    sentAt: new Date().toISOString(),
+  });
+
+  const results = [...(unsentResults.get(device.serialNumber) ?? [])];
+  for (const command of claim.commands ?? []) {
+    if (!allowed.has(command.type)) {
+      results.push({
+        id: command.id,
+        outcome: "failed",
+        message: `Not allowed by the office bridge: add ${command.type} to allowCommands in its config.json`,
+      });
+      continue;
+    }
+    if (!config.apiKey) {
+      results.push({ id: command.id, outcome: "failed", message: "Set apiKey in the office bridge's config.json" });
+      continue;
+    }
+    try {
+      const { method, fields } = deviceCommandRequest(command, config, device);
+      const outcome = commandOutcome(parseSoapReply(await soapCall(config, method, fields), method));
+      results.push({ id: command.id, ...outcome });
+      console.log(`${tag} ${command.type} ${command.employeeCode} → ${outcome.outcome}: ${outcome.message ?? ""}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      results.push({ id: command.id, outcome: "failed", message: message.slice(0, 500) });
+      console.log(`${tag} ${command.type} ${command.employeeCode} → failed: ${message}`);
+    }
+  }
+
+  for (const pending of claim.awaitingStatus ?? []) {
+    try {
+      const xml = await soapCall(config, "GetCommandStatus", [
+        ["CommandId", pending.vendorCommandId],
+        ["UserName", config.esslUser],
+        ["UserPassword", config.esslPassword],
+      ]);
+      const { result } = parseSoapReply(xml, "GetCommandStatus");
+      const outcome = statusOutcome(result);
+      if (outcome) {
+        results.push({ id: pending.id, outcome, message: result ? `eSSL: ${result}` : null });
+        console.log(`${tag} command ${pending.vendorCommandId} → ${outcome}: ${result}`);
+      }
+    } catch (err) {
+      // Keep waiting; Omni fails it after 30 minutes without a confirmation.
+      console.log(`${tag} status check for command ${pending.vendorCommandId} failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  if (results.length === 0) return;
+  try {
+    await postSigned(`${device.ingestUrl}/commands/results`, device.ingestSecret, {
+      sentAt: new Date().toISOString(),
+      results,
+    });
+    unsentResults.delete(device.serialNumber);
+  } catch (err) {
+    unsentResults.set(device.serialNumber, results);
+    throw err;
+  }
+}
+
+/** Last error per task, so a persistent failure logs on change or every 10 min, not every pass. */
+const lastErrors = new Map();
+const REPEAT_ERROR_LOG_MS = 10 * 60_000;
+
+async function runSafely(label, task) {
+  try {
+    await task();
+    if (lastErrors.delete(label)) console.log(`${label}: recovered`);
+    return true;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const previous = lastErrors.get(label);
+    if (!previous || previous.message !== message || Date.now() - previous.loggedAt >= REPEAT_ERROR_LOG_MS) {
+      console.error(`${label}: ${message}`);
+      lastErrors.set(label, { message, loggedAt: Date.now() });
+    }
+    return false;
+  }
+}
+
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+async function watch(config, devices) {
+  const commandMs = Math.max(5, Number(config.commandIntervalSeconds ?? 15)) * 1000;
+  const punchMs = Math.max(1, Number(config.punchIntervalMinutes ?? 5)) * 60_000;
+  console.log(
+    `Watching ${devices.length} device(s): commands every ${commandMs / 1000}s, punches every ${punchMs / 60_000} min.`,
+  );
+  let nextPunchAt = 0;
+  for (;;) {
+    const started = Date.now();
+    const punchesDue = started >= nextPunchAt;
+    for (const device of devices) {
+      if (punchesDue) {
+        await runSafely(`[${device.label}] punches`, () => syncPunches(config, device, { quiet: true }));
+      }
+      await runSafely(`[${device.label}] commands`, () => processCommands(config, device));
+    }
+    if (punchesDue) nextPunchAt = started + punchMs;
+    await sleep(Math.max(1000, commandMs - (Date.now() - started)));
+  }
 }
 
 async function main() {
@@ -322,57 +666,21 @@ async function main() {
     return;
   }
 
-  const lastTimestamp = await readCursor(config);
-  const printSoap = args.has("--print-soap");
-  const { rows, skipped, note, from, to } = await fetchLogs(config, lastTimestamp, { printSoap });
-  if (note && rows.length === 0) {
-    console.log(`eSSL ${from} → ${to} returned no punch rows: ${note.slice(0, 500)}`);
-    if (/unauth/i.test(note)) {
-      console.log(
-        [
-          "",
-          "Web API auth failed (not the same as desktop eTimeTrackLite login unless both use the same DB).",
-          `  esslUser sent: ${config.esslUser}`,
-          `  serialNumber sent: ${config.serialNumber}`,
-          "  1) Log in at http://<host>:85/iclock/ with the same username/password.",
-          "  2) In the WEB app: Admin → Users → edit user → Is Admin (or full permissions).",
-          "  3) Or create a new web user there and put that login in config.json.",
-          "  4) If web login fails, run eTimeTrackDatabaseSettings on the server so Web uses the same DB as desktop.",
-        ].join("\n"),
-      );
+  const devices = deviceList(config);
+  if (args.has("--watch")) {
+    await watch(config, devices);
+    return;
+  }
+
+  const options = { dryRun: args.has("--dry-run"), printSoap: args.has("--print-soap") };
+  let ok = true;
+  for (const device of devices) {
+    ok = (await runSafely(`[${device.label}] punches`, () => syncPunches(config, device, options))) && ok;
+    if (!options.dryRun) {
+      ok = (await runSafely(`[${device.label}] commands`, () => processCommands(config, device))) && ok;
     }
-    return;
   }
-  if (rows.length === 0) {
-    console.log(`No new punches from ${from} to ${to}.`);
-    return;
-  }
-
-  const sendable = rows.filter((row) => row.event).length;
-  console.log(`Fetched ${rows.length} log(s) from ${from} to ${to} (${sendable} pushable, ${skipped} skipped).`);
-  console.log(`First row: ${rows[0].raw}`);
-
-  if (args.has("--dry-run")) {
-    for (const row of rows.slice(0, 5)) {
-      console.log(row.event ?? `(skipped) ${row.raw}`);
-    }
-    console.log("Dry run: nothing posted, cursor unchanged.");
-    return;
-  }
-
-  if (!config.ingestUrl || !config.ingestSecret || config.ingestSecret === "CHANGE_ME") {
-    throw new Error("Set ingestUrl and ingestSecret in config.json before a live push.");
-  }
-
-  let cursor = lastTimestamp;
-  for (let index = 0; index < rows.length; index += BATCH_SIZE) {
-    const batch = rows.slice(index, index + BATCH_SIZE);
-    const events = batch.flatMap((row) => (row.event ? [row.event] : []));
-    const result = events.length > 0 ? await pushBatch(config, events) : { accepted: 0, duplicates: 0, unmatched: 0 };
-    cursor = batch[batch.length - 1].timestamp;
-    await writeCursor(cursor);
-    console.log({ from: batch[0].timestamp, to: cursor, ...result });
-  }
+  if (!ok) process.exitCode = 1;
 }
 
 const invokedDirectly =

@@ -2,11 +2,21 @@
   "esslUrl": "http://192.168.1.220:85/iclock/WebAPIService.asmx",
   "esslUser": "CHANGE_ME",
   "esslPassword": "CHANGE_ME",
-  "serialNumber": "BRM9202760325",
+  "apiKey": "CHANGE_ME",
   "timezoneOffset": "+05:30",
   "syncFrom": "2026-09-24 00:00",
-  "ingestUrl": "https://YOUR_API_HOST/api/hrms/ingest/SOURCE_ID",
-  "ingestSecret": "CHANGE_ME",
+  "lookbackMinutes": 120,
+  "commandIntervalSeconds": 15,
+  "punchIntervalMinutes": 5,
+  "allowCommands": ["ADD_EMPLOYEE", "BLOCK", "UNBLOCK"],
+  "devices": [
+    {
+      "name": "office",
+      "serialNumber": "BJ2C183961076",
+      "ingestUrl": "https://YOUR_API_HOST/api/hrms/ingest/SOURCE_ID",
+      "ingestSecret": "CHANGE_ME"
+    }
+  ],
   "method": "GetTransactionsLog",
   "soapFields": ["FromDateTime", "ToDateTime", "SerialNumber", "UserName", "UserPassword", "strDataList"],
   "columns": {

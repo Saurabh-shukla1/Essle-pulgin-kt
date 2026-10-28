@@ -2,9 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildSoapEnvelope,
+  commandOutcome,
+  deviceCommandRequest,
+  deviceList,
   extractSoapResult,
   formatEsslDate,
+  isoInOffset,
+  laterTimestamp,
+  lookbackStart,
   parsePunchRows,
+  parseSoapReply,
+  soapEnvelope,
+  statusOutcome,
   signIngestBody,
   toIsoTimestamp,
 } from "./bridge.mjs";
@@ -79,4 +88,112 @@ test("ingest signature is hex hmac of the exact body", () => {
 test("sample request dates round-trip", () => {
   assert.equal(toIsoTimestamp("2021/05/22 09:05", "+05:30"), "2021-05-22T09:05:00+05:30");
   assert.equal(formatEsslDate("2021-05-22T09:05:00+05:30", "+05:30"), "2021-05-22 09:05");
+});
+
+test("isoInOffset renders epoch ms as local wall clock", () => {
+  assert.equal(isoInOffset(Date.parse("2026-10-28T03:35:00Z"), "+05:30"), "2026-10-28T09:05:00+05:30");
+});
+
+test("lookback starts before the cursor but never before syncFrom", () => {
+  const base = { ...config, syncFrom: "2026-10-28 08:00" };
+  assert.equal(lookbackStart("2026-10-28T12:00:00+05:30", base), "2026-10-28T10:00:00+05:30");
+  assert.equal(
+    lookbackStart("2026-10-28T12:00:00+05:30", { ...base, lookbackMinutes: 30 }),
+    "2026-10-28T11:30:00+05:30",
+  );
+  assert.equal(lookbackStart("2026-10-28T09:00:00+05:30", base), "2026-10-28T08:00:00+05:30");
+  assert.equal(
+    lookbackStart("2026-10-28T12:00:00+05:30", { ...base, lookbackMinutes: 0 }),
+    "2026-10-28T12:00:00+05:30",
+  );
+});
+
+test("cursor never moves backwards", () => {
+  const cursor = "2026-10-28T12:00:00+05:30";
+  assert.equal(laterTimestamp(cursor, "2026-10-28T10:30:00+05:30"), cursor);
+  assert.equal(laterTimestamp(cursor, "2026-10-28T12:05:00+05:30"), "2026-10-28T12:05:00+05:30");
+});
+
+const device = { serialNumber: "BJ2C183961076", label: "office" };
+const commandConfig = { ...config, apiKey: "11" };
+
+test("AddEmployee request follows the manual's field order, CommandId 0", () => {
+  const { method, fields } = deviceCommandRequest(
+    { type: "ADD_EMPLOYEE", employeeCode: "26", employeeName: " Ravi Kumar " },
+    commandConfig,
+    device,
+  );
+  assert.equal(method, "AddEmployee");
+  assert.deepEqual(fields.map(([name]) => name), [
+    "APIKey", "EmployeeCode", "EmployeeName", "CardNumber", "SerialNumber", "UserName", "UserPassword", "CommandId",
+  ]);
+  const xml = soapEnvelope(method, fields);
+  assert.match(xml, /<AddEmployee xmlns="http:\/\/tempuri.org\/"><APIKey>11<\/APIKey><EmployeeCode>26<\/EmployeeCode><EmployeeName>Ravi Kumar<\/EmployeeName><CardNumber><\/CardNumber><SerialNumber>BJ2C183961076<\/SerialNumber>/);
+  assert.match(xml, /<UserPassword>p&amp;ss<\/UserPassword><CommandId>0<\/CommandId>/);
+});
+
+test("block and unblock share BlockUnblockUser with IsBlock true/false", () => {
+  const block = deviceCommandRequest({ type: "BLOCK", employeeCode: "26", employeeName: "Ravi" }, commandConfig, device);
+  const unblock = deviceCommandRequest({ type: "UNBLOCK", employeeCode: "26", employeeName: "Ravi" }, commandConfig, device);
+  assert.equal(block.method, "BlockUnblockUser");
+  assert.deepEqual(block.fields.find(([name]) => name === "IsBlock"), ["IsBlock", "true"]);
+  assert.deepEqual(unblock.fields.find(([name]) => name === "IsBlock"), ["IsBlock", "false"]);
+  const del = deviceCommandRequest({ type: "DELETE", employeeCode: "26" }, commandConfig, device);
+  assert.equal(del.method, "DeleteUser");
+  assert.deepEqual(del.fields.map(([name]) => name), ["APIKey", "EmployeeCode", "SerialNumber", "UserName", "UserPassword", "CommandId"]);
+});
+
+test("reply parsing reads Result and CommandId, not CommandIds", () => {
+  const xml = `<soap:Envelope><soap:Body><AddEmployeeResponse xmlns="http://tempuri.org/">
+    <AddEmployeeResult>Success</AddEmployeeResult><CommandId>501</CommandId>
+  </AddEmployeeResponse></soap:Body></soap:Envelope>`;
+  assert.deepEqual(parseSoapReply(xml, "AddEmployee"), { result: "Success", commandId: "501" });
+  assert.throws(() => parseSoapReply("<faultstring>Server was unable</faultstring>", "AddEmployee"), /Server was unable/);
+  assert.deepEqual(
+    parseSoapReply("<X><DeleteUserResult>ok</DeleteUserResult><CommandIds>9</CommandIds></X>", "DeleteUser"),
+    { result: "ok", commandId: "" },
+  );
+});
+
+test("command outcome: success with an id waits for the device, anything else fails with eSSL's text", () => {
+  assert.deepEqual(commandOutcome({ result: "Success", commandId: "501" }), {
+    outcome: "sent",
+    vendorCommandId: "501",
+    message: "Success",
+  });
+  assert.deepEqual(commandOutcome({ result: "Successfully Blocked", commandId: "0" }), {
+    outcome: "applied",
+    message: "Successfully Blocked",
+  });
+  assert.equal(commandOutcome({ result: "Employee already exists", commandId: "" }).outcome, "failed");
+  assert.equal(commandOutcome({ result: "Unsuccessful", commandId: "5" }).outcome, "failed");
+  assert.equal(commandOutcome({ result: "Unathorised User", commandId: "" }).message, "eSSL: Unathorised User");
+  assert.equal(commandOutcome({ result: "", commandId: "" }).outcome, "failed");
+});
+
+test("status outcome waits until the device answers", () => {
+  assert.equal(statusOutcome("Success"), "applied");
+  assert.equal(statusOutcome("Failed"), "failed");
+  assert.equal(statusOutcome("Pending"), null);
+});
+
+test("devices list: one device from top-level fields, several with their own cursors", () => {
+  const single = deviceList({ ...config, ingestUrl: "https://x/api/hrms/ingest/a", ingestSecret: "s", syncFrom: "2026-10-01 00:00" });
+  assert.equal(single.length, 1);
+  assert.equal(single[0].serialNumber, "BRM9202760325");
+  assert.match(single[0].cursorPath, /cursor\.json$/);
+
+  const many = deviceList({
+    ...config,
+    syncFrom: "2026-10-01 00:00",
+    devices: [
+      { name: "gate", serialNumber: "AAA1", ingestUrl: "https://x/1", ingestSecret: "s1" },
+      { serialNumber: "BBB/2", ingestUrl: "https://x/2", ingestSecret: "s2", syncFrom: "2026-10-20 00:00" },
+    ],
+  });
+  assert.deepEqual(many.map((d) => d.label), ["gate", "BBB/2"]);
+  assert.match(many[0].cursorPath, /cursor-AAA1\.json$/);
+  assert.match(many[1].cursorPath, /cursor-BBB_2\.json$/);
+  assert.equal(many[0].syncFrom, "2026-10-01 00:00");
+  assert.equal(many[1].syncFrom, "2026-10-20 00:00");
 });
